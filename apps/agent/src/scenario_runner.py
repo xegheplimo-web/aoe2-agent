@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     from .entity_snapshot import EntitySnapshot
     from .policy.advice import PolicyRequest
     from .resource_ocr import ResourceReadings
-    from .turn_timing import TickTimings
+    from .turn_timing import LatencySnapshot, TickTimings
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class ScenarioResult:
     actions: list[str] = field(default_factory=list)
     inputs: list[str] = field(default_factory=list)
     observed_age: str = ""
+    latency: Mapping[str, object] | None = None
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -377,7 +379,21 @@ class _ScriptedInput:
         self._record("scroll")
 
 
-async def run_scenario_async(path: Path) -> ScenarioResult:
+def _latency_payload(snapshot: LatencySnapshot) -> dict[str, dict[str, object]]:
+    """Per-loop percentiles, so timings leave the process as plain JSON."""
+    return {
+        loop: {
+            "p50_ms": stats.p50_ms,
+            "p90_ms": stats.p90_ms,
+            "p95_ms": stats.p95_ms,
+            "max_ms": stats.max_ms,
+            "phase_p50_ms": dict(stats.phase_p50_ms),
+        }
+        for loop, stats in snapshot.loops.items()
+    }
+
+
+async def run_scenario_async(path: Path, *, collect_latency: bool = False) -> ScenarioResult:
     """Run one scripted trace through the real candidate and executor paths."""
     raw = cast("object", yaml.safe_load(path.read_text(encoding="utf-8")))
     fixture = _mapping(raw, "fixture")
@@ -464,17 +480,21 @@ async def run_scenario_async(path: Path) -> ScenarioResult:
         executor._rescan_full_fn = original[5]
         executor.clear_detected_entities()
         executor.unbind_ledger(token)
-    return ScenarioResult(path.stem, not failures, failures, actions, inputs, world.age)
+    latency = _latency_payload(ctx.latency.snapshot()) if collect_latency else None
+    return ScenarioResult(path.stem, not failures, failures, actions, inputs, world.age, latency)
 
 
-def run_scenario(path: Path) -> ScenarioResult:
-    return asyncio.run(run_scenario_async(path))
+def run_scenario(path: Path, *, collect_latency: bool = False) -> ScenarioResult:
+    return asyncio.run(run_scenario_async(path, collect_latency=collect_latency))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixtures", nargs="*", type=Path)
     parser.add_argument("--all", action="store_true")
+    parser.add_argument(
+        "--metrics", type=Path, help="Write per-scenario loop-latency JSON to this path"
+    )
     parsed = cast("dict[str, object]", vars(parser.parse_args(argv)))
     raw_paths = parsed["fixtures"]
     if not isinstance(raw_paths, list) or not all(isinstance(path, Path) for path in raw_paths):
@@ -484,9 +504,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths.extend(sorted((Path(__file__).parent / "scenarios" / "production").glob("*.yaml")))
     if not paths:
         parser.error("provide a production fixture or --all")
-    results = [run_scenario(path) for path in paths]
+    collect = isinstance(parsed["metrics"], Path)
+    results = [run_scenario(path, collect_latency=collect) for path in paths]
     for result in results:
         print(f"{'PASS' if result.passed else 'FAIL'} {result.name}: {', '.join(result.failures)}")
+    metrics = parsed["metrics"]
+    if isinstance(metrics, Path):
+        metrics.parent.mkdir(parents=True, exist_ok=True)
+        metrics.write_text(
+            json.dumps(
+                [
+                    {
+                        "name": result.name,
+                        "passed": result.passed,
+                        "failures": result.failures,
+                        "latency": result.latency,
+                    }
+                    for result in results
+                ],
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"metrics written to {metrics}")
     return int(not all(result.passed for result in results))
 
 
