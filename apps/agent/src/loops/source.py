@@ -84,10 +84,13 @@ def frame_refresh(
             return False
         finally:
             frames.clear_spatial_refresh(request)
-        if result.captured_at <= asked or not result.spatial_valid:
+        # Strict `<`: Windows `time.monotonic()` ticks at ~15.6 ms
+        # (GetTickCount64), so a capture taken just after `asked` reads EQUAL
+        # on the same tick — equality must mean fresh, not stale.
+        if result.captured_at < asked or not result.spatial_valid:
             log.warning(
                 "frame_refresh_rejected",
-                reason="old_capture" if result.captured_at <= asked else "input_changed",
+                reason="old_capture" if result.captured_at < asked else "input_changed",
                 input_revision=result.input_revision,
             )
             return False
