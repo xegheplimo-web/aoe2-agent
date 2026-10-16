@@ -25,7 +25,10 @@ def test_a_fresh_frame_is_almost_zero_milliseconds_old() -> None:
 def test_age_grows_with_the_clock() -> None:
     """The act loop skips a stale rule on this number, so it must move."""
     frame = Perception()
-    time.sleep(0.01)
+    # Windows `time.monotonic()` ticks at ~15.6 ms (GetTickCount64); a 10 ms
+    # sleep can stay inside the same tick and read as age 0.0. 50 ms
+    # guarantees at least two ticks on every platform.
+    time.sleep(0.05)
     assert frame.age_ms >= 10.0
 
 
